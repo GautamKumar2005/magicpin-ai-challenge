@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: magicpin-vera-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /v1/healthz
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MODEL
+        value: gemini-flash-latest
+      - key: TEAM_NAME
+        value: "Your Team Name"
+      - key: TEAM_MEMBERS
+        value: "Your Name"
+      - key: CONTACT_EMAIL
+        value: "you@example.com"
+      - key: BOT_VERSION
+        value: "1.0.0"
