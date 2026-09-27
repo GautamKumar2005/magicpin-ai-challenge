@@ -141,22 +141,30 @@ async def tick(body: TickRequest):
     return {"actions": actions}
 
 
+# --------------------------------------------------------------------------
+# Helper Configs & Utility Functions
+# --------------------------------------------------------------------------
 AUTO_REPLY_PATTERNS = [
     "thank you for reaching out", "we have received your message",
     "will get back to you", "out of office", "auto-reply", "automated message",
     "this is an automated response", "thank you for contacting", 
-    "we will contact you shortly", "samajh gayi", "aage badhati", "is this an automated response"
+    "we will contact you shortly", "samajh gayi", "aage badhati", 
+    "is this an automated response"
 ]
 
 def contains_hindi(text: str) -> bool:
+    """Quick check for Hindi/Hinglish indicators in merchant message."""
     hindi_keywords = {"theek", "sahi", "karo", "haan", "bhejo", "chalo", "samajh", "aage", "hoon"}
     words = set(text.lower().split())
     return bool(words.intersection(hindi_keywords))
 
 
+# --------------------------------------------------------------------------
+# POST /v1/reply Endpoint Definition
+# --------------------------------------------------------------------------
 @app.post("/v1/reply")
 async def reply(body: ReplyRequest):
-    # Fetch or create conversation
+    # 1. Fetch or Recover Conversation Context
     conv = conversation_store.get(body.conversation_id)
     if conv is None:
         merchant = context_store.get("merchant", body.merchant_id) if body.merchant_id else None
@@ -165,11 +173,11 @@ async def reply(body: ReplyRequest):
             body.conversation_id, body.merchant_id, body.customer_id, category_slug, None
         )
 
-    # 1. Early Termination Check
+    # 2. Check if Conversation is Already Terminated
     if conv.get("ended"):
         return {"action": "end", "rationale": "This conversation was already ended."}
 
-    # 2. Safe Context Retrieval (Prevents 'NoneType' has no attribute 'get' crash)
+    # 3. Safe Context Retrieval (Prevents 'NoneType' has no attribute 'get' crash)
     merchant_id = conv.get("merchant_id") or body.merchant_id
     merchant = context_store.get("merchant", merchant_id) if merchant_id else {}
     if merchant is None:
@@ -185,15 +193,18 @@ async def reply(body: ReplyRequest):
     if customer is None:
         customer = {}
 
-    # 3. Record incoming turn
-    repeat_count = conversation_store.record_incoming_turn(body.conversation_id, body.from_role, body.message)
+    # 4. Record Incoming Turn
+    repeat_count = conversation_store.record_incoming_turn(
+        body.conversation_id, body.from_role, body.message
+    )
 
-    # 4. Auto-Reply / Repeat Guard
+    # 5. Auto-Reply / Repeat Guard (Safe In-Memory State Checking)
     lowered_msg = body.message.lower()
     is_auto = repeat_count >= 2 or any(p in lowered_msg for p in AUTO_REPLY_PATTERNS)
 
     if is_auto:
-        if conv.get("autoreply_probed") or conversation_store.has_probed(body.conversation_id):
+        # Check if we probed once already during this conversation session
+        if conv.get("autoreply_probed", False):
             conv["ended"] = True
             if hasattr(conversation_store, "save"):
                 conversation_store.save(conv)
@@ -202,6 +213,7 @@ async def reply(body: ReplyRequest):
                 "rationale": "Auto-reply pattern persisted after initial probe; ending conversation."
             }
 
+        # Set probe flag for the first detection turn
         conv["autoreply_probed"] = True
         if hasattr(conversation_store, "save"):
             conversation_store.save(conv)
@@ -216,7 +228,7 @@ async def reply(body: ReplyRequest):
             "rationale": "Probing potential auto-reply message once."
         }
 
-    # 5. Intent Classification & Routing
+    # 6. Intent Classification & Strategic Routing
     classification = classify_incoming_message(body.message, repeat_count)
 
     if classification == "autoreply_confirmed":
@@ -250,38 +262,32 @@ async def reply(body: ReplyRequest):
             conversation_store.save(conv)
         return {
             "action": "end",
-            "rationale": "Merchant expressed hostile/opt-out intent; exiting."
+            "rationale": "Merchant expressed hostile/opt-out intent; terminating conversation."
         }
 
     if classification == "intent_confirm":
         if contains_hindi(body.message):
-            body_text = (
-                "Great! Onboarding aage badhane ke liye, kripya apni "
-                "GST details aur primary outlet address confirm karein."
-            )
+            body_text = "Aapka onboarding confirm ho gaya hai! Next step: Kripya apna GSTIN aur outlet address share karein."
+            cta_text = "Share GSTIN and Address"
         else:
-            body_text = (
-                "Great! To move forward with onboarding, please share your "
-                "GST registration details and primary outlet address."
-            )
-        cta_text = "Submit Business Details"
+            body_text = "Your onboarding is confirmed! Next step: Please share your GSTIN and main outlet address to proceed."
+            cta_text = "Share GSTIN and Address"
 
         conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
         return {
             "action": "send",
             "body": body_text,
             "cta": cta_text,
-            "rationale": "Merchant confirmed intent; providing direct onboarding step."
+            "rationale": "Merchant confirmed intent; providing direct next onboarding step and concrete action."
         }
 
-    # 6. Fallback / Normal Response Flow
+    # 7. Fallback / Standard Conversation Flow
     directive = (
         "Continue the conversation naturally, advancing toward the original trigger's goal, "
         "and directly acknowledge what the merchant just said."
     )
     composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
     return _send_or_wait(body.conversation_id, composed)
-    
 # --------------------------------------------------------------------------
 @app.post("/v1/teardown")
 async def teardown():
