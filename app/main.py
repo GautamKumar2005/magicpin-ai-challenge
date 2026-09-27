@@ -145,11 +145,18 @@ AUTO_REPLY_PATTERNS = [
     "thank you for reaching out", "we have received your message",
     "will get back to you", "out of office", "auto-reply", "automated message",
     "this is an automated response", "thank you for contacting", 
-    "we will contact you shortly", "samajh gayi", "aage badhati"
+    "we will contact you shortly", "samajh gayi", "aage badhati", "is this an automated response"
 ]
+
+def contains_hindi(text: str) -> bool:
+    hindi_keywords = {"theek", "sahi", "karo", "haan", "bhejo", "chalo", "samajh", "aage", "hoon"}
+    words = set(text.lower().split())
+    return bool(words.intersection(hindi_keywords))
+
 
 @app.post("/v1/reply")
 async def reply(body: ReplyRequest):
+    # Fetch or create conversation
     conv = conversation_store.get(body.conversation_id)
     if conv is None:
         merchant = context_store.get("merchant", body.merchant_id) if body.merchant_id else None
@@ -158,22 +165,47 @@ async def reply(body: ReplyRequest):
             body.conversation_id, body.merchant_id, body.customer_id, category_slug, None
         )
 
+    # 1. Early Termination Check
     if conv.get("ended"):
         return {"action": "end", "rationale": "This conversation was already ended."}
 
-    # Record message turn count
+    # 2. Safe Context Retrieval (Prevents 'NoneType' has no attribute 'get' crash)
+    merchant_id = conv.get("merchant_id") or body.merchant_id
+    merchant = context_store.get("merchant", merchant_id) if merchant_id else {}
+    if merchant is None:
+        merchant = {}
+
+    category_slug = conv.get("category_slug") or merchant.get("category_slug")
+    category = context_store.get("category", category_slug) if category_slug else {}
+    if category is None:
+        category = {}
+
+    customer_id = conv.get("customer_id") or body.customer_id
+    customer = context_store.get("customer", customer_id) if customer_id else {}
+    if customer is None:
+        customer = {}
+
+    # 3. Record incoming turn
     repeat_count = conversation_store.record_incoming_turn(body.conversation_id, body.from_role, body.message)
 
-    # GUARD 1: Terminate immediately if repeated message or auto-reply signature detected
+    # 4. Auto-Reply / Repeat Guard
     lowered_msg = body.message.lower()
-    if repeat_count >= 2 or any(p in lowered_msg for p in AUTO_REPLY_PATTERNS):
-        if conv.get("autoreply_probed"):
+    is_auto = repeat_count >= 2 or any(p in lowered_msg for p in AUTO_REPLY_PATTERNS)
+
+    if is_auto:
+        if conv.get("autoreply_probed") or conversation_store.has_probed(body.conversation_id):
             conv["ended"] = True
+            if hasattr(conversation_store, "save"):
+                conversation_store.save(conv)
             return {
                 "action": "end",
-                "rationale": "Auto-reply/repeated message pattern detected post-probe; terminating conversation."
+                "rationale": "Auto-reply pattern persisted after initial probe; ending conversation."
             }
+
         conv["autoreply_probed"] = True
+        if hasattr(conversation_store, "save"):
+            conversation_store.save(conv)
+
         body_text = "Is this an automated response, or are you available to chat?"
         cta_text = "Confirm Availability"
         conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
@@ -184,135 +216,72 @@ async def reply(body: ReplyRequest):
             "rationale": "Probing potential auto-reply message once."
         }
 
-def contains_hindi(text: str) -> bool:
-    hindi_keywords = {"theek", "sahi", "karo", "haan", "bhejo", "chalo", "samajh", "aage", "hoon"}
-    words = set(text.lower().split())
-    return bool(words.intersection(hindi_keywords))
-# --------------------------------------------------------------------------
-# POST /v1/reply
-# --------------------------------------------------------------------------
-@app.post("/v1/reply")
-async def reply(body: ReplyRequest):
-    conv = conversation_store.get(body.conversation_id)
-    if conv is None:
-        # Standalone replay scenarios may call /v1/reply without a prior
-        # /v1/tick for this exact conversation_id. Recover gracefully.
-        merchant = context_store.get("merchant", body.merchant_id) if body.merchant_id else None
-        category_slug = merchant.get("category_slug") if merchant else None
-        conv = conversation_store.create(
-            body.conversation_id, body.merchant_id, body.customer_id, category_slug, None
-        )
-
-    if conv.get("ended"):
-        return {"action": "end", "rationale": "This conversation was already ended."}
-
-    merchant = context_store.get("merchant", conv["merchant_id"]) if conv["merchant_id"] else None
-    category = context_store.get("category", conv.get("category_slug")) if conv.get("category_slug") else None
-    customer = context_store.get("customer", conv.get("customer_id")) if conv.get("customer_id") else None
-
-    repeat_count = conversation_store.record_incoming_turn(body.conversation_id, body.from_role, body.message)
+    # 5. Intent Classification & Routing
     classification = classify_incoming_message(body.message, repeat_count)
-    # 1. Immediate keyword check for canned OOO / automated replies
-    lowered_msg = body.message.lower()
-    if any(keyword in lowered_msg for keyword in AUTO_REPLY_KEYWORDS):
-        if conv.get("autoreply_probed"):
-            conv["ended"] = True
-            return {
-                "action": "end",
-                "rationale": "Automated message keyword detected after probe; exiting gracefully."
-            }
+
     if classification == "autoreply_confirmed":
         conv["ended"] = True
+        if hasattr(conversation_store, "save"):
+            conversation_store.save(conv)
         return {
             "action": "end",
-            "rationale": (
-                "Same message seen 3+ times verbatim — this is the merchant's WhatsApp "
-                "Business canned auto-reply, not a human. Exiting gracefully instead of "
-                "burning further turns."
-            ),
+            "rationale": "Same message seen verbatim multiple times; exiting auto-reply loop."
         }
-
-    if classification == "autoreply_probe":
-        if conv.get("autoreply_probed"):
-            # Probed once already and it happened again — treat as confirmed.
-            conv["ended"] = True
-            return {
-                "action": "end",
-                "rationale": "Auto-reply pattern persisted after one probe; exiting gracefully.",
-            }
-        conv["autoreply_probed"] = True
-        directive = (
-            "This reply looks like a canned WhatsApp Business auto-reply (forwarding-to-team "
-            "language), not a real human response. Send ONE short, low-friction message asking "
-            "if the merchant/owner personally wants to quickly check this themselves (frame it "
-            "as a 2-minute ask). Do not repeat your first message."
-        )
-        composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
-        conversation_store.record_bot_turn(body.conversation_id, composed["body"], composed["cta"])
-        return {"action": "send", "body": composed["body"], "cta": composed["cta"], "rationale": composed["rationale"]}
 
     if classification == "decline":
         conv["ended"] = True
+        if hasattr(conversation_store, "save"):
+            conversation_store.save(conv)
         return {
             "action": "end",
-            "rationale": "Merchant explicitly declined / opted out. Exiting gracefully, no further nudges.",
+            "rationale": "Merchant explicitly declined / opted out. Exiting gracefully."
         }
 
     if classification == "wait":
         return {
             "action": "wait",
             "wait_seconds": 1800,
-            "rationale": "Merchant asked for time; backing off 30 minutes before re-engaging.",
+            "rationale": "Merchant asked for time; backing off 30 minutes before re-engaging."
         }
 
     if classification == "hostile":
-        directive = (
-            "The merchant's message is hostile/abusive, or raises something unrelated to "
-            "magicpin/GBP/marketing (e.g. an unrelated request). Stay calm and polite, do not "
-            "escalate or over-apologize. If it's an unrelated ask, briefly note you can't help "
-            "with that specific thing here, then steer back to the original topic in the same "
-            "message."
-        )
-        composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
-        conversation_store.record_bot_turn(body.conversation_id, composed["body"], composed["cta"])
-        return {"action": "send", "body": composed["body"], "cta": composed["cta"], "rationale": composed["rationale"]}
+        conv["ended"] = True
+        if hasattr(conversation_store, "save"):
+            conversation_store.save(conv)
+        return {
+            "action": "end",
+            "rationale": "Merchant expressed hostile/opt-out intent; exiting."
+        }
 
     if classification == "intent_confirm":
         if contains_hindi(body.message):
             body_text = (
                 "Great! Onboarding aage badhane ke liye, kripya apni "
-                "GST details aur outlet address confirm karein."
+                "GST details aur primary outlet address confirm karein."
             )
-            cta_text = "Submit Business Details"
         else:
             body_text = (
                 "Great! To move forward with onboarding, please share your "
                 "GST registration details and primary outlet address."
             )
-            cta_text = "Submit Business Details"
+        cta_text = "Submit Business Details"
 
-        conversation_store.record_bot_turn(
-            body.conversation_id, body_text, cta_text
-        )
-
+        conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
         return {
             "action": "send",
             "body": body_text,
             "cta": cta_text,
-            "rationale": "Merchant confirmed intent; providing concrete next step in matching language."
+            "rationale": "Merchant confirmed intent; providing direct onboarding step."
         }
-        # normal
-        directive = (
-            "Continue the conversation naturally, advancing toward the original trigger's goal, "
-            "and directly acknowledge what the merchant just said."
-        )
-        composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
-        conversation_store.record_bot_turn(body.conversation_id, composed["body"], composed["cta"])
-        return {"action": "send", "body": composed["body"], "cta": composed["cta"], "rationale": composed["rationale"]}
 
-
-# --------------------------------------------------------------------------
-# POST /v1/teardown (optional, per testing brief §11)
+    # 6. Fallback / Normal Response Flow
+    directive = (
+        "Continue the conversation naturally, advancing toward the original trigger's goal, "
+        "and directly acknowledge what the merchant just said."
+    )
+    composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
+    return _send_or_wait(body.conversation_id, composed)
+    
 # --------------------------------------------------------------------------
 @app.post("/v1/teardown")
 async def teardown():
