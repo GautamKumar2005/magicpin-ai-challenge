@@ -141,11 +141,48 @@ async def tick(body: TickRequest):
     return {"actions": actions}
 
 
-AUTO_REPLY_KEYWORDS = [
+AUTO_REPLY_PATTERNS = [
     "thank you for reaching out", "we have received your message",
     "will get back to you", "out of office", "auto-reply", "automated message",
-    "this is an automated response", "thank you for contacting", "we will contact you shortly"
+    "this is an automated response", "thank you for contacting", 
+    "we will contact you shortly", "samajh gayi", "aage badhati"
 ]
+
+@app.post("/v1/reply")
+async def reply(body: ReplyRequest):
+    conv = conversation_store.get(body.conversation_id)
+    if conv is None:
+        merchant = context_store.get("merchant", body.merchant_id) if body.merchant_id else None
+        category_slug = merchant.get("category_slug") if merchant else None
+        conv = conversation_store.create(
+            body.conversation_id, body.merchant_id, body.customer_id, category_slug, None
+        )
+
+    if conv.get("ended"):
+        return {"action": "end", "rationale": "This conversation was already ended."}
+
+    # Record message turn count
+    repeat_count = conversation_store.record_incoming_turn(body.conversation_id, body.from_role, body.message)
+
+    # GUARD 1: Terminate immediately if repeated message or auto-reply signature detected
+    lowered_msg = body.message.lower()
+    if repeat_count >= 2 or any(p in lowered_msg for p in AUTO_REPLY_PATTERNS):
+        if conv.get("autoreply_probed"):
+            conv["ended"] = True
+            return {
+                "action": "end",
+                "rationale": "Auto-reply/repeated message pattern detected post-probe; terminating conversation."
+            }
+        conv["autoreply_probed"] = True
+        body_text = "Is this an automated response, or are you available to chat?"
+        cta_text = "Confirm Availability"
+        conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
+        return {
+            "action": "send",
+            "body": body_text,
+            "cta": cta_text,
+            "rationale": "Probing potential auto-reply message once."
+        }
 
 def contains_hindi(text: str) -> bool:
     hindi_keywords = {"theek", "sahi", "karo", "haan", "bhejo", "chalo", "samajh", "aage", "hoon"}
