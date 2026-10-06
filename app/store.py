@@ -66,6 +66,8 @@ class ConversationStore:
         self._lock = threading.Lock()
         self.conversations: dict[str, dict[str, Any]] = {}
         self._used_suppression_keys: set[str] = set()
+        self._merchant_messages: dict[str, list[str]] = {}
+        self._merchant_autoreply_probed: set[str] = set()
 
     def suppression_key_used(self, key: str) -> bool:
         return bool(key) and key in self._used_suppression_keys
@@ -122,14 +124,35 @@ class ConversationStore:
         conv["sent_bodies"].append(body.strip().lower())
         conv["last_cta"] = cta
 
-    def record_incoming_turn(self, conversation_id: str, from_role: str, message: str) -> int:
+    def is_merchant_autoreply_probed(self, merchant_id: str) -> bool:
+        with self._lock:
+            return merchant_id in self._merchant_autoreply_probed
+
+    def mark_merchant_autoreply_probed(self, merchant_id: str) -> None:
+        if merchant_id:
+            with self._lock:
+                self._merchant_autoreply_probed.add(merchant_id)
+
+    def record_incoming_turn(
+        self,
+        conversation_id: str,
+        from_role: str,
+        message: str,
+        merchant_id: Optional[str] = None,
+    ) -> int:
         """Returns how many times this exact message has appeared from the
-        counterparty in this conversation (used for auto-reply detection)."""
+        counterparty in this conversation or merchant history (used for auto-reply detection)."""
         conv = self.conversations[conversation_id]
         conv["turns"].append({"from": from_role, "body": message, "ts": time.time()})
         normalized = message.strip().lower()
         conv["merchant_messages_normalized"].append(normalized)
-        return conv["merchant_messages_normalized"].count(normalized)
+        count = conv["merchant_messages_normalized"].count(normalized)
+        if merchant_id:
+            with self._lock:
+                m_list = self._merchant_messages.setdefault(merchant_id, [])
+                m_list.append(normalized)
+                count = max(count, m_list.count(normalized))
+        return count
 
     def was_body_already_sent(self, conversation_id: str, body: str) -> bool:
         conv = self.conversations.get(conversation_id)
@@ -141,6 +164,8 @@ class ConversationStore:
         with self._lock:
             self.conversations.clear()
             self._used_suppression_keys.clear()
+            self._merchant_messages.clear()
+            self._merchant_autoreply_probed.clear()
 
 
 context_store = ContextStore()

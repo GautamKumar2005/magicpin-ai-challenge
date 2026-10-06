@@ -1,3 +1,4 @@
+import asyncio
 import time
 from datetime import datetime, timezone
 
@@ -84,10 +85,10 @@ async def push_context(request: Request):
 # --------------------------------------------------------------------------
 @app.post("/v1/tick")
 async def tick(body: TickRequest):
-    actions: list[dict] = []
+    candidates = []
 
     for trigger_id in body.available_triggers:
-        if len(actions) >= config.MAX_ACTIONS_PER_TICK:
+        if len(candidates) >= config.MAX_ACTIONS_PER_TICK:
             break
 
         trigger = context_store.get("trigger", trigger_id)
@@ -113,7 +114,24 @@ async def tick(body: TickRequest):
         if conversation_store.get(conversation_id) is not None:
             continue  # already started for this trigger
 
-        composed = composer.compose_proactive(category, merchant, trigger, customer, already_sent=[])
+        candidates.append((
+            trigger_id, trigger, merchant_id, merchant, category_slug,
+            category, customer_id, customer, conversation_id, suppression_key
+        ))
+
+    if not candidates:
+        return {"actions": []}
+
+    tasks = [
+        asyncio.to_thread(composer.compose_proactive, cat, merch, trig, cust, [])
+        for (_tid, trig, _mid, merch, _cslug, cat, _cid, cust, _conv_id, _skey) in candidates
+    ]
+    composed_results = await asyncio.gather(*tasks)
+
+    actions: list[dict] = []
+    for item, composed in zip(candidates, composed_results):
+        (trigger_id, trigger, merchant_id, merchant, category_slug,
+         category, customer_id, customer, conversation_id, suppression_key) = item
 
         send_as = "merchant_on_behalf" if customer else "vera"
         conversation_store.create(conversation_id, merchant_id, customer_id, category_slug, trigger_id)
@@ -183,7 +201,7 @@ async def reply(body: ReplyRequest):
     if merchant is None:
         merchant = {}
 
-    category_slug = conv.get("category_slug") or merchant.get("category_slug")
+    category_slug = conv.get("category_slug") or (merchant.get("category_slug") if isinstance(merchant, dict) else None)
     category = context_store.get("category", category_slug) if category_slug else {}
     if category is None:
         category = {}
@@ -193,9 +211,13 @@ async def reply(body: ReplyRequest):
     if customer is None:
         customer = {}
 
-    # 4. Record Incoming Turn
+    # 4. Record Incoming Turn with merchant-level tracking
+    merchant_id = body.merchant_id or conv.get("merchant_id")
     repeat_count = conversation_store.record_incoming_turn(
-        body.conversation_id, body.from_role, body.message
+        body.conversation_id, body.from_role, body.message, merchant_id=merchant_id
+    )
+    already_probed = bool(conv.get("autoreply_probed")) or (
+        bool(merchant_id) and conversation_store.is_merchant_autoreply_probed(merchant_id)
     )
 
     # 5. Auto-Reply / Repeat Guard (Safe In-Memory State Checking)
@@ -204,7 +226,7 @@ async def reply(body: ReplyRequest):
 
     if is_auto:
         # Check if we probed once already during this conversation session
-        if conv.get("autoreply_probed", False):
+        if already_probed or repeat_count >= 2:
             conv["ended"] = True
             if hasattr(conversation_store, "save"):
                 conversation_store.save(conv)
@@ -215,6 +237,8 @@ async def reply(body: ReplyRequest):
 
         # Set probe flag for the first detection turn
         conv["autoreply_probed"] = True
+        if merchant_id:
+            conversation_store.mark_merchant_autoreply_probed(merchant_id)
         if hasattr(conversation_store, "save"):
             conversation_store.save(conv)
 
@@ -238,6 +262,26 @@ async def reply(body: ReplyRequest):
         return {
             "action": "end",
             "rationale": "Same message seen verbatim multiple times; exiting auto-reply loop."
+        }
+
+    if classification == "autoreply_probe":
+        if already_probed or repeat_count >= 2:
+            conv["ended"] = True
+            return {
+                "action": "end",
+                "rationale": "Auto-reply pattern persisted after one probe; exiting gracefully.",
+            }
+        conv["autoreply_probed"] = True
+        if merchant_id:
+            conversation_store.mark_merchant_autoreply_probed(merchant_id)
+        body_text = "Is this an automated response, or are you available to chat?"
+        cta_text = "Confirm Availability"
+        conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
+        return {
+            "action": "send",
+            "body": body_text,
+            "cta": cta_text,
+            "rationale": "Probing potential auto-reply message once."
         }
 
     if classification == "decline":
@@ -267,11 +311,17 @@ async def reply(body: ReplyRequest):
 
     if classification == "intent_confirm":
         if contains_hindi(body.message):
-            body_text = "Aapka onboarding confirm ho gaya hai! Next step: Kripya apna GSTIN aur outlet address share karein."
-            cta_text = "Share GSTIN and Address"
+            body_text = (
+                "Done! Next step proceed karne aur confirm karne ke liye, "
+                "kripya apni GST details aur outlet address share karein."
+            )
+            cta_text = "Confirm Details"
         else:
-            body_text = "Your onboarding is confirmed! Next step: Please share your GSTIN and main outlet address to proceed."
-            cta_text = "Share GSTIN and Address"
+            body_text = (
+                "Done! Here is the next step to proceed and confirm: "
+                "please share your GST registration details and primary outlet address."
+            )
+            cta_text = "Confirm Details"
 
         conversation_store.record_bot_turn(body.conversation_id, body_text, cta_text)
         return {
@@ -287,7 +337,13 @@ async def reply(body: ReplyRequest):
         "and directly acknowledge what the merchant just said."
     )
     composed = composer.compose_reply(category, merchant, customer, conv, body.message, directive)
-    return _send_or_wait(body.conversation_id, composed)
+    conversation_store.record_bot_turn(body.conversation_id, composed["body"], composed["cta"])
+    return {
+        "action": "send",
+        "body": composed["body"],
+        "cta": composed["cta"],
+        "rationale": composed["rationale"],
+    }
 # --------------------------------------------------------------------------
 @app.post("/v1/teardown")
 async def teardown():

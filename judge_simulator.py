@@ -29,8 +29,7 @@ LLM_API_KEY = os.getenv("GEMINI_API_KEY")
  # <-- PUT YOUR API KEY HERE
 if not LLM_API_KEY:
     raise ValueError("LLM_API_KEY is not set in the .env file")
-# Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
-LLM_MODEL = "gemini-3.8-flash"  # <-- Optional: specify model or leave empty for default
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")  # Blazing fast scoring
 
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"
@@ -102,7 +101,8 @@ def print_score_bar(dimension: str, score: int, max_score: int = 10):
     bar_filled = int((score / max_score) * 20)
     bar_empty = 20 - bar_filled
     color = Colors.GREEN if score >= 7 else Colors.YELLOW if score >= 4 else Colors.RED
-    print(f"  {dimension:22} [{color}{'█' * bar_filled}{Colors.DIM}{'░' * bar_empty}{Colors.RESET}] {color}{score:2}/{max_score}{Colors.RESET}")
+    bar_str = f"{color}{'#' * bar_filled}{Colors.DIM}{'-' * bar_empty}{Colors.RESET}"
+    print(f"  {dimension:22} [{bar_str}] {color}{score:2}/{max_score}{Colors.RESET}")
 
 def print_reason(text: str):
     wrapped = text[:200] + "..." if len(text) > 200 else text
@@ -222,11 +222,11 @@ class GeminiProvider(LLMProvider):
 
         try:
             client = genai.Client(api_key=self.api_key)
-            interaction = client.interactions.create(
+            resp = client.models.generate_content(
                 model=self.model,
-                input=full_input
+                contents=full_input
             )
-            return interaction.output_text
+            return resp.text
         except Exception as e:
             print_fail(f"Google GenAI API Error: {str(e)}")
             if "404" in str(e) or "not_found" in str(e):
@@ -647,6 +647,9 @@ class JudgeSimulator:
             print_warn(f"metadata: {err}")
         else:
             print_success(f"metadata — Team: {data.get('team_name', '?')}, Model: {data.get('model', '?')}")
+
+        # Reset bot state before new evaluation run
+        self.client._request("POST", "/v1/teardown", 5, {})
 
         print_section("CONTEXT PUSH")
         for slug, cat in self.dataset.categories.items():

@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # --- LLM configuration (Gemini) ---
     GEMINI_API_KEY: str = ""
-    MODEL: str = "gemini-flash-latest"
+    MODEL: str = "gemini-3.5-flash-lite"
     LLM_TIMEOUT_SECONDS: float = 20.0
     LLM_MAX_TOKENS: int = 500
 
@@ -34,9 +34,15 @@ class Settings(BaseSettings):
     def TEAM_MEMBERS(self) -> List[str]:
         return [m.strip() for m in self.TEAM_MEMBERS_RAW.split(",") if m.strip()]
 
+    BOT_URL: Optional[str] = None
+    LLM_PROVIDER: Optional[str] = "gemini"
+    LLM_MODEL: Optional[str] = "gemini-3.8-flash"
+    LLM_API_KEY: Optional[str] = None
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 # Active settings instance used by app modules
 settings = Settings()
